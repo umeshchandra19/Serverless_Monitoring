@@ -1,0 +1,165 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Generated CloudWatch alarms and dashboard for monitoring (scripts/generate_alarms.py)",
+  "Resources": {
+    "AlarmErrorsMonitoringDemoOrders": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": "monitoring-svc-errors-monitoring-demo-orders",
+        "AlarmDescription": "severity=P2; runbook=https://wiki.example.com/runbooks/orders-errors; Error log volume for monitoring-demo-orders is above 10 per 5 minutes",
+        "Namespace": "Monitoring/Logs",
+        "MetricName": "ErrorCount",
+        "Dimensions": [
+          {
+            "Name": "Service",
+            "Value": "monitoring-demo-orders"
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 300,
+        "EvaluationPeriods": 3,
+        "DatapointsToAlarm": 2,
+        "Threshold": 10,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    },
+    "AlarmApi5xxMonitoringDemoOrdersApi": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": "monitoring-svc-api5xx-monitoring-demo-orders-api",
+        "AlarmDescription": "severity=P1; runbook=https://wiki.example.com/runbooks/api-5xx; 5xx rate of monitoring-demo-orders-api above 5% (ignored below 20 requests/min)",
+        "Metrics": [
+          {
+            "Id": "rate",
+            "Expression": "IF(requests < 20, 0, 100 * errors / requests)",
+            "Label": "5xx %",
+            "ReturnData": true
+          },
+          {
+            "Id": "errors",
+            "MetricStat": {
+              "Metric": {
+                "Namespace": "Monitoring/Api",
+                "MetricName": "Http5xx",
+                "Dimensions": [
+                  {
+                    "Name": "Api",
+                    "Value": "monitoring-demo-orders-api"
+                  }
+                ]
+              },
+              "Period": 60,
+              "Stat": "Sum"
+            },
+            "ReturnData": false
+          },
+          {
+            "Id": "requests",
+            "MetricStat": {
+              "Metric": {
+                "Namespace": "Monitoring/Api",
+                "MetricName": "RequestCount",
+                "Dimensions": [
+                  {
+                    "Name": "Api",
+                    "Value": "monitoring-demo-orders-api"
+                  }
+                ]
+              },
+              "Period": 60,
+              "Stat": "Sum"
+            },
+            "ReturnData": false
+          }
+        ],
+        "EvaluationPeriods": 5,
+        "DatapointsToAlarm": 3,
+        "Threshold": 5,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    },
+    "AlarmApiLatencyMonitoringDemoOrdersApi": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": "monitoring-svc-apilatency-monitoring-demo-orders-api",
+        "AlarmDescription": "severity=P2; runbook=https://wiki.example.com/runbooks/api-5xx; p95 latency of monitoring-demo-orders-api above 1500 ms",
+        "Namespace": "Monitoring/Api",
+        "MetricName": "Latency",
+        "Dimensions": [
+          {
+            "Name": "Api",
+            "Value": "monitoring-demo-orders-api"
+          }
+        ],
+        "ExtendedStatistic": "p95",
+        "Period": 60,
+        "EvaluationPeriods": 5,
+        "DatapointsToAlarm": 3,
+        "Threshold": 1500,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    },
+    "AlarmProbeOrdersHealth": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": "monitoring-svc-probe-orders-health",
+        "AlarmDescription": "severity=P1; runbook=https://wiki.example.com/runbooks/endpoint-down; Health probe orders-health failing for 3 consecutive minutes",
+        "Namespace": "Monitoring/Probes",
+        "MetricName": "Availability",
+        "Dimensions": [
+          {
+            "Name": "Target",
+            "Value": "orders-health"
+          }
+        ],
+        "Statistic": "Minimum",
+        "Period": 60,
+        "EvaluationPeriods": 3,
+        "DatapointsToAlarm": 3,
+        "Threshold": 1,
+        "ComparisonOperator": "LessThanThreshold",
+        "TreatMissingData": "breaching"
+      }
+    },
+    "AlarmCertOrdersHealth": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmName": "monitoring-svc-cert-orders-health",
+        "AlarmDescription": "severity=P3; runbook=https://wiki.example.com/runbooks/endpoint-down; TLS certificate of orders-health expires in less than 14 days",
+        "Namespace": "Monitoring/Probes",
+        "MetricName": "CertDaysRemaining",
+        "Dimensions": [
+          {
+            "Name": "Target",
+            "Value": "orders-health"
+          }
+        ],
+        "Statistic": "Minimum",
+        "Period": 3600,
+        "EvaluationPeriods": 1,
+        "Threshold": 14,
+        "ComparisonOperator": "LessThanThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    },
+    "OverviewDashboard": {
+      "Type": "AWS::CloudWatch::Dashboard",
+      "Properties": {
+        "DashboardName": "monitoring-overview",
+        "DashboardBody": {
+          "Fn::Sub": "{\"widgets\":[{\"type\":\"text\",\"x\":0,\"y\":0,\"width\":24,\"height\":1,\"properties\":{\"markdown\":\"## API: monitoring-demo-orders-api\"}},{\"type\":\"metric\",\"x\":0,\"y\":1,\"width\":8,\"height\":6,\"properties\":{\"metrics\":[[\"Monitoring/Api\",\"RequestCount\",\"Api\",\"monitoring-demo-orders-api\"],[\".\",\"Http4xx\",\"Api\",\"monitoring-demo-orders-api\"],[\".\",\"Http5xx\",\"Api\",\"monitoring-demo-orders-api\"]],\"view\":\"timeSeries\",\"stacked\":false,\"region\":\"${AWS::Region}\",\"title\":\"Requests / 4xx / 5xx\",\"period\":60,\"stat\":\"Sum\"}},{\"type\":\"metric\",\"x\":8,\"y\":1,\"width\":8,\"height\":6,\"properties\":{\"metrics\":[[{\"expression\":\"IF(requests < 5, 0, 100 * errors / requests)\",\"label\":\"5xx %\",\"id\":\"rate\"}],[\"Monitoring/Api\",\"Http5xx\",\"Api\",\"monitoring-demo-orders-api\",{\"id\":\"errors\",\"visible\":false}],[\"Monitoring/Api\",\"RequestCount\",\"Api\",\"monitoring-demo-orders-api\",{\"id\":\"requests\",\"visible\":false}]],\"view\":\"timeSeries\",\"stacked\":false,\"region\":\"${AWS::Region}\",\"title\":\"5xx rate %\",\"period\":60,\"stat\":\"Sum\",\"yAxis\":{\"left\":{\"min\":0}}}},{\"type\":\"metric\",\"x\":16,\"y\":1,\"width\":8,\"height\":6,\"properties\":{\"metrics\":[[\"Monitoring/Api\",\"Latency\",\"Api\",\"monitoring-demo-orders-api\",{\"stat\":\"p50\",\"label\":\"p50\"}],[\".\",\"Latency\",\"Api\",\"monitoring-demo-orders-api\",{\"stat\":\"p95\",\"label\":\"p95\"}],[\".\",\"Latency\",\"Api\",\"monitoring-demo-orders-api\",{\"stat\":\"p99\",\"label\":\"p99\"}]],\"view\":\"timeSeries\",\"stacked\":false,\"region\":\"${AWS::Region}\",\"title\":\"Latency (ms)\",\"period\":60,\"stat\":\"Sum\"}},{\"type\":\"text\",\"x\":0,\"y\":7,\"width\":24,\"height\":1,\"properties\":{\"markdown\":\"## Service: monitoring-demo-orders\"}},{\"type\":\"metric\",\"x\":0,\"y\":8,\"width\":12,\"height\":6,\"properties\":{\"metrics\":[[\"Monitoring/Logs\",\"ErrorCount\",\"Service\",\"monitoring-demo-orders\"],[\".\",\"WarnCount\",\"Service\",\"monitoring-demo-orders\"],[\".\",\"CriticalCount\",\"Service\",\"monitoring-demo-orders\"]],\"view\":\"timeSeries\",\"stacked\":false,\"region\":\"${AWS::Region}\",\"title\":\"Errors / warnings / critical\",\"period\":60,\"stat\":\"Sum\"}},{\"type\":\"metric\",\"x\":12,\"y\":8,\"width\":12,\"height\":6,\"properties\":{\"metrics\":[[\"Monitoring/Logs\",\"RequestLatencyMs\",\"Service\",\"monitoring-demo-orders\",{\"stat\":\"p50\"}],[\".\",\"RequestLatencyMs\",\"Service\",\"monitoring-demo-orders\",{\"stat\":\"p95\"}]],\"view\":\"timeSeries\",\"stacked\":false,\"region\":\"${AWS::Region}\",\"title\":\"Request latency (ms)\",\"period\":60,\"stat\":\"Sum\"}},{\"type\":\"text\",\"x\":0,\"y\":14,\"width\":24,\"height\":1,\"properties\":{\"markdown\":\"## Synthetic probes\"}},{\"type\":\"metric\",\"x\":0,\"y\":15,\"width\":8,\"height\":6,\"properties\":{\"metrics\":[[\"Monitoring/Probes\",\"Availability\",\"Target\",\"orders-health\"]],\"view\":\"timeSeries\",\"stacked\":false,\"region\":\"${AWS::Region}\",\"title\":\"Availability (1 = up)\",\"period\":60,\"stat\":\"Minimum\",\"yAxis\":{\"left\":{\"min\":0,\"max\":1.1}}}},{\"type\":\"metric\",\"x\":8,\"y\":15,\"width\":8,\"height\":6,\"properties\":{\"metrics\":[[\"Monitoring/Probes\",\"ResponseTimeMs\",\"Target\",\"orders-health\"]],\"view\":\"timeSeries\",\"stacked\":false,\"region\":\"${AWS::Region}\",\"title\":\"Response time (ms)\",\"period\":60,\"stat\":\"Average\"}},{\"type\":\"metric\",\"x\":16,\"y\":15,\"width\":8,\"height\":6,\"properties\":{\"metrics\":[[\"Monitoring/Probes\",\"CertDaysRemaining\",\"Target\",\"orders-health\"]],\"view\":\"timeSeries\",\"stacked\":false,\"region\":\"${AWS::Region}\",\"title\":\"Certificate days remaining\",\"period\":3600,\"stat\":\"Minimum\"}},{\"type\":\"text\",\"x\":0,\"y\":21,\"width\":24,\"height\":1,\"properties\":{\"markdown\":\"## Alerts and incidents\"}},{\"type\":\"alarm\",\"x\":0,\"y\":22,\"width\":12,\"height\":6,\"properties\":{\"title\":\"Alarm status\",\"alarms\":[\"arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:monitoring-svc-errors-monitoring-demo-orders\",\"arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:monitoring-svc-api5xx-monitoring-demo-orders-api\",\"arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:monitoring-svc-apilatency-monitoring-demo-orders-api\",\"arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:monitoring-svc-probe-orders-health\",\"arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:monitoring-svc-cert-orders-health\"]}},{\"type\":\"log\",\"x\":12,\"y\":22,\"width\":12,\"height\":6,\"properties\":{\"region\":\"${AWS::Region}\",\"title\":\"Most recent error signatures\",\"view\":\"table\",\"query\":\"SOURCE '/aws/lambda/monitoring-log-ingest' | fields @timestamp, service, count, sample | filter type = 'error_signature' | sort @timestamp desc | limit 20\"}}]}"
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "DashboardUrl": {
+      "Value": {
+        "Fn::Sub": "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=monitoring-overview"
+      }
+    }
+  }
+}

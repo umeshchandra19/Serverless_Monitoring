@@ -1,0 +1,426 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless monitoring and alerting pipeline. Lambda functions turn logs and API access logs into metrics,
+  run synthetic health probes, and route alarms (with context and incident tracking) to SNS / Slack.
+
+Parameters:
+  Project:
+    Type: String
+    Default: monitoring
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+    Description: Prefix for every resource name. Alarms named "<Project>-svc-*" are routed by the alert router.
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email address subscribed to alerts (leave empty to skip). You must confirm the subscription email.
+  SlackWebhookUrl:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Optional incoming-webhook URL (Slack/Teams style) that also receives alerts.
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365]
+  ProbeSchedule:
+    Type: String
+    Default: rate(1 minute)
+  ProbeTargets:
+    Type: String
+    Default: "[]"
+    Description: 'JSON list, e.g. [{"name":"orders-health","url":"https://api.example.com/health","max_latency_ms":1500}]'
+  SlowRequestMs:
+    Type: Number
+    Default: 1000
+  AlertPatterns:
+    Type: String
+    Default: "[]"
+    Description: 'JSON list of regular expressions that make a log line an instant critical alert, e.g. ["OutOfMemory","payment gateway"]'
+  ServiceMap:
+    Type: String
+    Default: "{}"
+    Description: 'JSON object mapping a log group name to a friendlier service name'
+  DeployDemoApp:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Deploy a small demo API (with failure injection) that the pipeline monitors.
+  ManageApiGatewayAccountRole:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      API Gateway needs an account-wide CloudWatch Logs role before it can write access logs. Set to true ONLY if your
+      account has not configured one yet (it changes an account-level setting).
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  HasProbeTargets: !Not [!Equals [!Ref ProbeTargets, "[]"]]
+  DeployDemo: !Equals [!Ref DeployDemoApp, "true"]
+  ManageApiAccount: !And [!Condition DeployDemo, !Equals [!Ref ManageApiGatewayAccountRole, "true"]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    CodeUri: src/
+    MemorySize: 256
+    Timeout: 30
+    Tracing: Active
+    Environment:
+      Variables:
+        IGNORE_LOG_GROUP_PREFIXES: !Sub "/aws/lambda/${Project}-"
+        SERVICE_MAP: !Ref ServiceMap
+
+Resources:
+  # ---------------------------------------------------------------- shared
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${Project}-alerts"
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal: {Service: cloudwatch.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals: {"aws:SourceAccount": !Ref "AWS::AccountId"}
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  IncidentTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${Project}-incidents"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      TimeToLiveSpecification: {AttributeName: ttl, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  FailedEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Project}-failed-events"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  # ---------------------------------------------------------------- log groups (explicit, with retention)
+  LogIngestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${Project}-log-ingest", RetentionInDays: !Ref LogRetentionDays}
+  ApiIngestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${Project}-api-ingest", RetentionInDays: !Ref LogRetentionDays}
+  HealthProbeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${Project}-health-probe", RetentionInDays: !Ref LogRetentionDays}
+  AlertRouterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub "/aws/lambda/${Project}-alert-router", RetentionInDays: !Ref LogRetentionDays}
+
+  # ---------------------------------------------------------------- functions
+  LogIngestFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: LogIngestLogGroup
+    Properties:
+      FunctionName: !Sub "${Project}-log-ingest"
+      Description: Application logs -> metrics, error signatures, critical-log events
+      Handler: handlers.log_ingest.handler
+      Environment:
+        Variables:
+          ALERT_PATTERNS: !Ref AlertPatterns
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource: !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        DestinationConfig:
+          OnFailure: {Type: SQS, Destination: !GetAtt FailedEventsQueue.Arn}
+
+  ApiIngestFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ApiIngestLogGroup
+    Properties:
+      FunctionName: !Sub "${Project}-api-ingest"
+      Description: API Gateway access logs -> API metrics and trace exemplars
+      Handler: handlers.api_ingest.handler
+      Environment:
+        Variables:
+          SLOW_REQUEST_MS: !Ref SlowRequestMs
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        DestinationConfig:
+          OnFailure: {Type: SQS, Destination: !GetAtt FailedEventsQueue.Arn}
+
+  HealthProbeFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: HealthProbeLogGroup
+    Properties:
+      FunctionName: !Sub "${Project}-health-probe"
+      Description: Synthetic availability, latency and certificate checks
+      Handler: handlers.health_probe.handler
+      Environment:
+        Variables:
+          PROBE_TARGETS: !Ref ProbeTargets
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ProbeSchedule
+            Enabled: !If [HasProbeTargets, true, false]
+
+  AlertRouterFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: AlertRouterLogGroup
+    Properties:
+      FunctionName: !Sub "${Project}-alert-router"
+      Description: Alarm and critical-log events -> enriched, de-duplicated notifications + incident ledger
+      Handler: handlers.alert_router.handler
+      Environment:
+        Variables:
+          INCIDENT_TABLE: !Ref IncidentTable
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+          DASHBOARD_NAME: !Sub "${Project}-overview"
+          LOG_INGEST_LOG_GROUP: !Ref LogIngestLogGroup
+          API_INGEST_LOG_GROUP: !Ref ApiIngestLogGroup
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref IncidentTable}
+        - SNSPublishMessagePolicy: {TopicName: !GetAtt AlertTopic.TopicName}
+        - Statement:
+            - Effect: Allow
+              Action: logs:FilterLogEvents
+              Resource:
+                - !GetAtt LogIngestLogGroup.Arn
+                - !GetAtt ApiIngestLogGroup.Arn
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        DestinationConfig:
+          OnFailure: {Type: SQS, Destination: !GetAtt FailedEventsQueue.Arn}
+      Events:
+        AlarmStateChange:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [aws.cloudwatch]
+              detail-type: [CloudWatch Alarm State Change]
+              detail:
+                alarmName:
+                  - prefix: !Sub "${Project}-svc-"
+        CriticalLog:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [monitoring.logs]
+              detail-type: [LogAlert]
+
+  # CloudWatch Logs may invoke the two ingest functions from any log group in this account and region.
+  LogIngestPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LogIngestFunction
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceAccount: !Ref "AWS::AccountId"
+      SourceArn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+  ApiIngestPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiIngestFunction
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceAccount: !Ref "AWS::AccountId"
+      SourceArn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+
+  # ---------------------------------------------------------------- pipeline health (does NOT depend on the router)
+  PipelineErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-pipeline-lambda-errors"
+      AlarmDescription: One of the monitoring Lambda functions is failing. Check the dashboard and the failed-events queue.
+      Metrics:
+        - {Id: total, Expression: "SUM(METRICS())", Label: Pipeline errors, ReturnData: true}
+        - Id: e1
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref LogIngestFunction}]}
+            Period: 300
+            Stat: Sum
+        - Id: e2
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref ApiIngestFunction}]}
+            Period: 300
+            Stat: Sum
+        - Id: e3
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref HealthProbeFunction}]}
+            Period: 300
+            Stat: Sum
+        - Id: e4
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref AlertRouterFunction}]}
+            Period: 300
+            Stat: Sum
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  FailedEventsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Project}-pipeline-failed-events"
+      AlarmDescription: Events that the monitoring functions could not process landed in the failed-events queue.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt FailedEventsQueue.QueueName}]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  PipelineDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${Project}-pipeline"
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Log events ingested per service","region":"${AWS::Region}","view":"timeSeries","stacked":false,"period":60,"stat":"Sum",
+            "metrics":[[{"expression":"SEARCH('{Monitoring/Logs,Service} MetricName=\"LogEvents\"', 'Sum', 60)","id":"s1"}]]}},
+          {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Pipeline Lambda invocations and errors","region":"${AWS::Region}","view":"timeSeries","stacked":false,"period":60,"stat":"Sum",
+            "metrics":[["AWS/Lambda","Invocations","FunctionName","${Project}-log-ingest"],[".","Errors",".","."],
+                       ["AWS/Lambda","Invocations","FunctionName","${Project}-api-ingest"],[".","Errors",".","."],
+                       ["AWS/Lambda","Invocations","FunctionName","${Project}-alert-router"],[".","Errors",".","."]]}},
+          {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"Duration p95 (ms)","region":"${AWS::Region}","view":"timeSeries","stacked":false,"period":60,"stat":"p95",
+            "metrics":[["AWS/Lambda","Duration","FunctionName","${Project}-log-ingest"],["AWS/Lambda","Duration","FunctionName","${Project}-api-ingest"],
+                       ["AWS/Lambda","Duration","FunctionName","${Project}-health-probe"],["AWS/Lambda","Duration","FunctionName","${Project}-alert-router"]]}},
+          {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Alerting: alerts sent and time to notify (s)","region":"${AWS::Region}","view":"timeSeries","stacked":false,"period":300,"stat":"Sum",
+            "metrics":[[{"expression":"SEARCH('{Monitoring/Alerting,Severity} MetricName=\"AlertsSent\"', 'Sum', 300)","id":"a1"}],
+                       [{"expression":"SEARCH('{Monitoring/Alerting,Severity} MetricName=\"NotifyLatencySeconds\"', 'Maximum', 300)","id":"a2"}]]}},
+          {"type":"metric","x":0,"y":12,"width":12,"height":6,"properties":{"title":"Incident duration (s)","region":"${AWS::Region}","view":"timeSeries","stacked":false,"period":3600,"stat":"Average",
+            "metrics":[[{"expression":"SEARCH('{Monitoring/Alerting,Severity} MetricName=\"IncidentDurationSeconds\"', 'Average', 3600)","id":"i1"}]]}},
+          {"type":"metric","x":12,"y":12,"width":12,"height":6,"properties":{"title":"Failed-events queue depth","region":"${AWS::Region}","view":"timeSeries","stacked":false,"period":300,"stat":"Maximum",
+            "metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${Project}-failed-events"]]}}
+        ]}
+
+  # ---------------------------------------------------------------- demo app (optional)
+  DemoApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployDemo
+    Properties: {LogGroupName: !Sub "/aws/apigateway/${Project}-demo-orders-api", RetentionInDays: !Ref LogRetentionDays}
+
+  DemoFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployDemo
+    Properties: {LogGroupName: !Sub "/aws/lambda/${Project}-demo-orders", RetentionInDays: !Ref LogRetentionDays}
+
+  DemoFunction:
+    Type: AWS::Serverless::Function
+    Condition: DeployDemo
+    DependsOn: DemoFunctionLogGroup
+    Properties:
+      FunctionName: !Sub "${Project}-demo-orders"
+      Handler: demo_app.app.handler
+      Timeout: 10
+      Environment:
+        Variables:
+          FAILURE_RATE: "0.02"
+      Events:
+        Health: {Type: Api, Properties: {RestApiId: !Ref DemoApi, Path: /health, Method: get}}
+        ListOrders: {Type: Api, Properties: {RestApiId: !Ref DemoApi, Path: /orders, Method: get}}
+        CreateOrder: {Type: Api, Properties: {RestApiId: !Ref DemoApi, Path: /orders, Method: post}}
+        GetOrder: {Type: Api, Properties: {RestApiId: !Ref DemoApi, Path: "/orders/{id}", Method: get}}
+
+  DemoApi:
+    Type: AWS::Serverless::Api
+    Condition: DeployDemo
+    Properties:
+      Name: !Sub "${Project}-demo-orders-api"
+      StageName: prod
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt DemoApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","responseLatency":"$context.responseLatency","integrationLatency":"$context.integrationLatency","errorMessage":"$context.error.message","traceId":"$context.xrayTraceId","ip":"$context.identity.sourceIp"}'
+
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Condition: ManageApiAccount
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: apigateway.amazonaws.com}, Action: "sts:AssumeRole"}
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Condition: ManageApiAccount
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  DemoFunctionLogSubscription:
+    Type: AWS::Logs::SubscriptionFilter
+    Condition: DeployDemo
+    DependsOn: LogIngestPermission
+    Properties:
+      LogGroupName: !Ref DemoFunctionLogGroup
+      FilterPattern: ""
+      DestinationArn: !GetAtt LogIngestFunction.Arn
+
+  DemoApiLogSubscription:
+    Type: AWS::Logs::SubscriptionFilter
+    Condition: DeployDemo
+    DependsOn: ApiIngestPermission
+    Properties:
+      LogGroupName: !Ref DemoApiAccessLogGroup
+      FilterPattern: ""
+      DestinationArn: !GetAtt ApiIngestFunction.Arn
+
+Outputs:
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  IncidentTableName:
+    Value: !Ref IncidentTable
+  LogIngestFunctionName:
+    Value: !Ref LogIngestFunction
+    Description: Subscribe your application log groups to this function (scripts/subscribe_log_group.py)
+  ApiIngestFunctionName:
+    Value: !Ref ApiIngestFunction
+    Description: Subscribe your API Gateway access log groups to this function
+  PipelineDashboardUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Project}-pipeline"
+  DemoApiUrl:
+    Condition: DeployDemo
+    Value: !Sub "https://${DemoApi}.execute-api.${AWS::Region}.amazonaws.com/prod"

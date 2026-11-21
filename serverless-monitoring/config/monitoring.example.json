@@ -1,0 +1,16 @@
+{
+  "project": "monitoring",
+  "dashboard_name": "monitoring-overview",
+  "log_ingest_log_group": "/aws/lambda/monitoring-log-ingest",
+  "services": [
+    {"name": "monitoring-demo-orders", "errors_per_5min": 10, "severity": "P2",
+     "runbook": "https://wiki.example.com/runbooks/orders-errors"}
+  ],
+  "apis": [
+    {"name": "monitoring-demo-orders-api", "error_rate_percent": 5, "min_requests_per_min": 20,
+     "p95_latency_ms": 1500, "severity": "P1", "runbook": "https://wiki.example.com/runbooks/api-5xx"}
+  ],
+  "probes": [
+    {"name": "orders-health", "severity": "P1", "runbook": "https://wiki.example.com/runbooks/endpoint-down", "cert_days": 14}
+  ]
+}

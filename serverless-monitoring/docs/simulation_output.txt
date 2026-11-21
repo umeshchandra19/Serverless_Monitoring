@@ -1,0 +1,81 @@
+SIMULATION: synthetic traffic, real handler code, no AWS
+============================================================
+Traffic: 40 minutes, outage in minutes 14-27 (database timeouts)
+Handlers produced 120 metric records, 251 structured log lines, 1 critical-log event(s)
+
+minute  requests  5xx   5xx%   p95 latency
+    0        46    0    0.0       226 ms
+    3        38    0    0.0       229 ms
+    6        48    1    2.1       228 ms
+    9        43    0    0.0       194 ms
+   12        41    2    4.9       223 ms
+   13        41    0    0.0       207 ms
+   14        43   17   39.5      3791 ms
+   15        41   16   39.0      4028 ms
+   18        48   22   45.8      3971 ms
+   21        41   14   34.1      4030 ms
+   24        44   18   40.9      4081 ms
+   27        43   15   34.9      4119 ms
+   28        36    0    0.0       218 ms
+   30        43    0    0.0       229 ms
+   33        41    0    0.0       226 ms
+   36        38    0    0.0       233 ms
+   39        44    1    2.3       212 ms
+
+Alarm rule (local evaluation): [(16, 'ALARM'), (30, 'OK')]
+
+============================================================
+NOTIFICATIONS SENT
+============================================================
+
+--- 10:16:41 UTC | subject: [P2] LOG: log-alert:orders-fn
+[P2] LOG: log-alert:orders-fn
+Event-driven alert (no alarm needed): seen 1x in one log batch.
+Target:   orders-fn
+What:     Critical log event in orders-fn: timeout after 10.00s
+Why:      2026-11-19T10:16:07Z req-x Task timed out after 10.00 seconds
+Since:    2026-11-19 10:16:40 UTC
+Dashboard: https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#dashboards:name=monitoring-overview
+
+Top errors (last 15 min):
+  - 234x  DatabaseTimeout: database timeout while loading order 2697
+  - 1x  2026-11-19T10:16:07Z req-x Task timed out after 10.00 seconds
+Log group: /aws/lambda/orders-fn
+
+--- 10:18:36 UTC | subject: [P1] ALARM: monitoring-svc-api5xx-orders-api
+[P1] ALARM: monitoring-svc-api5xx-orders-api
+Target:   orders-api
+What:     5xx rate of orders-api above 5% (ignored below 20 requests/min)
+Why:      Threshold Crossed: 3 out of the last 5 datapoints were greater than the threshold (5.0).
+Since:    2026-11-19 10:18:30 UTC
+Runbook:  https://wiki.example.com/runbooks/api-5xx
+Dashboard: https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#dashboards:name=monitoring-overview
+Alarm:    https://ap-south-1.console.aws.amazon.com/cloudwatch/home?region=ap-south-1#alarmsV2:alarm/monitoring-svc-api5xx-orders-api
+
+Top errors (last 15 min):
+  - 234x  DatabaseTimeout: database timeout while loading order 2697
+  - 1x  2026-11-19T10:16:07Z req-x Task timed out after 10.00 seconds
+
+Example failing/slow requests:
+  - 500 GET /orders  4195 ms  (5xx)  https://ap-south-1.console.aws.amazon.com/xray/home?region=ap-south-1#/traces/1-67401717-2cf72140bd9bc648
+  - 502 GET /orders  4177 ms  (5xx)  https://ap-south-1.console.aws.amazon.com/xray/home?region=ap-south-1#/traces/1-67401611-3f5e3b8cc0582da5
+  - 503 GET /orders  4092 ms  (5xx)  https://ap-south-1.console.aws.amazon.com/xray/home?region=ap-south-1#/traces/1-67401504-f7bf52447db2a7aa
+
+--- 10:32:36 UTC | subject: [P1] OK: monitoring-svc-api5xx-orders-api
+[P1] OK: monitoring-svc-api5xx-orders-api
+Recovered after 14 min 0 s.
+At: 2026-11-19 10:32:30 UTC
+
+============================================================
+INCIDENT LEDGER
+============================================================
+{
+  "status": "RESOLVED",
+  "severity": "P1",
+  "opened_at": "2026-11-19T10:18:30.000000+00:00",
+  "resolved_at": "2026-11-19T10:32:30.000000+00:00",
+  "duration_seconds": 840,
+  "notify_latency_seconds": 6
+}
+
+Note: all numbers above come from synthetic data and stated assumptions (metric delay 90s). They illustrate how the pipeline behaves; they are not a measurement of your systems.

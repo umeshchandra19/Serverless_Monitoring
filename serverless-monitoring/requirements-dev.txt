@@ -1,0 +1,4 @@
+# Only needed for the checks in CI / on your laptop. The Lambda functions themselves use nothing but the
+# Python standard library and boto3 (already present in the Lambda runtime).
+PyYAML
+cfn-lint
